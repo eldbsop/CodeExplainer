@@ -2,10 +2,13 @@ import argparse
 import sys
 
 import ai_client
+import formatter
 import git_utils
+import prompts
+import safety
 
 
-def collect_git_info():
+def collect_git_info(args):
     """Git 변경 사항을 수집해서 (status, diff)를 돌려준다. 변경이 없으면 종료한다."""
     if not git_utils.is_git_repo():
         print("[ERROR] Git 저장소가 아닙니다. 프로젝트 루트 디렉토리에서 실행해 주세요.")
@@ -27,6 +30,11 @@ def collect_git_info():
     print(f"[INFO] Git status 수집 완료: {changed_files}개 파일 변경 감지")
     print(f"[INFO] Git diff 수집 완료: {diff_lines}줄")
 
+    if args.safe_mode:
+        diff, masked, truncated = safety.apply_safe_mode(diff)
+        print(f"[INFO] safe-mode 적용: 민감정보 {masked}건 마스킹"
+              + (", diff 일부만 전송(분량 제한)" if truncated else ""))
+
     return status, diff
 
 
@@ -46,36 +54,70 @@ def request_ai(args, system_prompt, user_prompt):
         sys.exit(1)
 
 
+def print_warnings(warnings):
+    for w in warnings:
+        print(f"[WARN] {w}")
+
+
 def cmd_commit(args):
-    status, diff = collect_git_info()
+    status, diff = collect_git_info(args)
 
-    # 임시 프롬프트: 4단계에서 제대로 설계할 예정
-    system_prompt = "너는 Git 커밋 메시지를 작성하는 도우미야."
-    user_prompt = f"아래 변경 사항에 대한 커밋 메시지를 한국어로 작성해줘.\n\n{diff}"
+    raw = request_ai(
+        args,
+        prompts.COMMIT_SYSTEM_PROMPT,
+        prompts.build_commit_user_prompt(status, diff),
+    )
+    message, warnings = formatter.format_commit(raw)
+    if not message:
+        print("[ERROR] AI가 빈 응답을 돌려줬습니다. 다시 실행해 주세요.")
+        sys.exit(1)
 
-    result = request_ai(args, system_prompt, user_prompt)
-    print("[DONE] 생성 완료")
+    print("[DONE] 커밋 메시지 생성 완료")
+    print_warnings(warnings)
+    print()
     print("--- Commit Message ---")
-    print(result)
+    print(message)
     print("----------------------")
+    print("[INFO] 생성된 메시지는 초안입니다. 검토 후 적용해 주세요.")
 
 
 def cmd_pr(args):
-    status, diff = collect_git_info()
+    status, diff = collect_git_info(args)
     branch = git_utils.get_current_branch()
     print(f"[INFO] 현재 브랜치: {branch}")
-    # 4단계에서 PR 생성을 붙일 예정
-    print("[TODO] PR 생성은 다음 단계에서 구현합니다.")
+
+    raw = request_ai(
+        args,
+        prompts.PR_SYSTEM_PROMPT,
+        prompts.build_pr_user_prompt(branch, status, diff),
+    )
+    title, body, warnings = formatter.format_pr(raw)
+    if not title:
+        print("[ERROR] AI가 빈 응답을 돌려줬습니다. 다시 실행해 주세요.")
+        sys.exit(1)
+
+    print("[DONE] PR 초안 생성 완료")
+    print_warnings(warnings)
+    print()
+    print("--- PR Title ---")
+    print(title)
+    print()
+    print("--- PR Body ---")
+    print(body)
+    print("----------------")
+    print("[INFO] 생성된 PR 초안은 참고용입니다. 검토 후 적용해 주세요.")
 
 
-def add_ai_options(parser):
-    """commit/pr 명령이 공통으로 쓰는 AI 파라미터 옵션을 추가한다."""
+def add_common_options(parser):
+    """commit/pr 명령이 공통으로 쓰는 옵션을 추가한다."""
     parser.add_argument("--model", default=ai_client.DEFAULT_MODEL,
                         help=f"사용할 모델 (기본값: {ai_client.DEFAULT_MODEL})")
     parser.add_argument("--temperature", type=float, default=ai_client.DEFAULT_TEMPERATURE,
                         help=f"창의성 0~1 (기본값: {ai_client.DEFAULT_TEMPERATURE})")
     parser.add_argument("--max-tokens", type=int, default=ai_client.DEFAULT_MAX_TOKENS,
                         help=f"최대 응답 토큰 수 (기본값: {ai_client.DEFAULT_MAX_TOKENS})")
+    parser.add_argument("--safe-mode", action="store_true",
+                        help="민감정보 마스킹 + diff 분량 제한(최대 10개 파일, 200줄) 후 전송")
 
 
 def build_parser():
@@ -83,11 +125,11 @@ def build_parser():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     commit_parser = subparsers.add_parser("commit", help="커밋 메시지 생성")
-    add_ai_options(commit_parser)
+    add_common_options(commit_parser)
     commit_parser.set_defaults(func=cmd_commit)
 
     pr_parser = subparsers.add_parser("pr", help="PR 제목/본문 생성")
-    add_ai_options(pr_parser)
+    add_common_options(pr_parser)
     pr_parser.set_defaults(func=cmd_pr)
 
     return parser
